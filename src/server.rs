@@ -11,6 +11,20 @@ use tokio::sync::mpsc::{Receiver, Sender, channel};
 use crate::IrohRuntime;
 use crate::connection::{IrohConnection, IrohListener, connection_node_id_string};
 
+use std::fs::OpenOptions;
+use std::io::Write;
+
+fn debug_log(msg: &str) {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("C:\\temp\\iroh_debug.txt")
+        .unwrap();
+
+    writeln!(file, "{msg}").unwrap();
+}
+
+
 #[derive(GodotClass)]
 #[class(tool, no_init, base=MultiplayerPeerExtension)]
 struct IrohServer {
@@ -153,8 +167,28 @@ impl IMultiplayerPeerExtension for IrohServer {
             };
             let accepted_peer_sender = self.accepted_peer_sender.clone();
             IrohRuntime::spawn(async move {
-                let connection = IrohConnection::accept(connection, peer_id).await?;
-                accepted_peer_sender.send((peer_id, connection)).await?;
+                match IrohConnection::accept(connection, peer_id).await {
+                    Ok(connection) => {
+                        debug_log(&format!(
+                            "[server] IrohConnection accepted peer {}",
+                            peer_id
+                        ));
+
+                        if let Err(e) = accepted_peer_sender.send((peer_id, connection)).await {
+                            debug_log(&format!(
+                                "[server] failed sending accepted peer: {:#}",
+                                e
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        debug_log(&format!(
+                            "[server] IrohConnection::accept failed: {:#}",
+                            e
+                        ));
+                    }
+                }
+
                 Ok::<(), anyhow::Error>(())
             });
         }

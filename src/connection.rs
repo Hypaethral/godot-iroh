@@ -3,7 +3,7 @@ use std::collections::{HashMap, hash_map::Entry};
 use anyhow::{Context, bail};
 use base64::prelude::*;
 use bytes::{Buf, Bytes};
-use godot::{classes::multiplayer_peer::TransferMode, global::godot_error, prelude::godot_warn};
+use godot::{classes::multiplayer_peer::TransferMode};
 use iroh::{
     Endpoint, EndpointId, SecretKey,
     endpoint::{Connection, presets, QuicTransportConfig, VarInt},
@@ -15,6 +15,19 @@ use tokio::{
 
 use crate::{ALPN, IrohRuntime};
 
+use std::fs::OpenOptions;
+use std::io::Write;
+
+fn debug_log(msg: &str) {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("C:\\temp\\iroh_debug.txt")
+        .unwrap();
+
+    writeln!(file, "{msg}").unwrap();
+}
+
 pub(crate) async fn build_endpoint(secret_key: Option<SecretKey>) -> anyhow::Result<Endpoint> {
     let transport: QuicTransportConfig = QuicTransportConfig::default();
     let mut builder = Endpoint::builder(presets::N0)
@@ -24,10 +37,12 @@ pub(crate) async fn build_endpoint(secret_key: Option<SecretKey>) -> anyhow::Res
     // rebuilds, which is how the server recognizes a reconnecting client
     // and reissues its original peer id. Server passes None (fresh identity
     // each session); client passes a persistent key.
+    let has_secret_key = secret_key.is_some();
     if let Some(secret_key) = secret_key {
         builder = builder.secret_key(secret_key);
     }
     let endpoint = builder.bind().await?;
+    debug_log(&format!("[debug] client build_endpoint with sk = {} endpoint id = {:?}", has_secret_key, endpoint.id()));
     Ok(endpoint)
 }
 
@@ -53,11 +68,25 @@ impl IrohListener {
         let (connection_sender, connection_receiver) = channel(32);
         tokio::spawn(async move {
             while let Some(incoming) = endpoint_clone.accept().await {
-                let Ok(connection) = incoming.await else {
-                    continue;
-                };
-                if connection_sender.send(connection).await.is_err() {
-                    break;
+                debug_log("[server] incoming connection object");
+
+                match incoming.await {
+                    Ok(connection) => {
+                        debug_log(&format!(
+                            "[server] QUIC accepted from {:?}",
+                            connection.remote_id()
+                        ));
+
+                        if connection_sender.send(connection).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug_log(&format!(
+                            "[server] QUIC handshake failed: {:#}",
+                            e
+                        ));
+                    }
                 }
             }
         });
@@ -116,10 +145,10 @@ impl IrohConnection {
         // (For direct-vs-relay, use the in-game ping RTT, or add a log over
         // connection.paths()/PathInfo::remote_addr per the iroh 0.96 API.)
         let connection_clone = connection.clone();
-        godot_warn!("[iroh] connection established (remote {:?})", connection_clone.remote_id());
+        debug_log(&format!("[debug-iroh] connection established (remote {:?})", connection_clone.remote_id()));
         tokio::spawn(async move {
             let reason = connection_clone.closed().await;
-            godot_warn!("[iroh] connection closed (remote {:?}): {:?}", connection_clone.remote_id(), reason);
+            debug_log(&format!("[debug-iroh] connection closed (remote {:?}): {:?}", connection_clone.remote_id(), reason));
         });
 
         // Unreliable packet send loop
@@ -140,12 +169,12 @@ impl IrohConnection {
                 }
                 let max_datagram_size = connection_clone.max_datagram_size().unwrap_or(1024);
                 if buffer.len() > max_datagram_size {
-                    godot_warn!(
+                    debug_log(&format!(
                         "Unreliable packet on channel {} (size: {}) exceeds {} bytes and will likely be discarded by the network",
                         channel,
                         buffer.len(),
                         max_datagram_size,
-                    );
+                    ));
                 }
                 if connection_clone.send_datagram(buffer.into()).is_err() {
                     break;
@@ -261,12 +290,12 @@ impl IrohConnection {
                         stream.write_i32(channel).await?;
                         while let Some(packet) = receiver.recv().await {
                             if packet.len() > u16::MAX as usize {
-                                godot_error!(
-                                    "Reliable packet on channel {} (size: {}) exceeds the maximum allowed size of {} bytes and cannot be sent",
+                                debug_log(&format!(
+                                    "ERR: Reliable packet on channel {} (size: {}) exceeds the maximum allowed size of {} bytes and cannot be sent",
                                     channel,
                                     packet.len(),
                                     u16::MAX,
-                                );
+                                ));
                             } else {
                                 stream.write_u16(packet.len().try_into()?).await?;
                                 stream.write_all(&packet).await?;
