@@ -9,7 +9,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::IrohRuntime;
-use crate::connection::{IrohConnection, IrohListener};
+use crate::connection::{IrohConnection, IrohListener, connection_node_id_string};
 
 #[derive(GodotClass)]
 #[class(tool, no_init, base=MultiplayerPeerExtension)]
@@ -20,6 +20,12 @@ struct IrohServer {
     accepted_peer_receiver: Receiver<(i32, IrohConnection)>,
     refuse_new_connections: bool,
     peers: HashMap<i32, IrohConnection>,
+    // peer_id -> base64 node id, recorded when a peer first connects and kept
+    // even after disconnect so a reconnecting identity can be matched back to
+    // its original peer id. reconnect_authorized maps an authorized node id
+    // (populated by authorize_reconnect) to the peer id it should reclaim.
+    peer_node_ids: HashMap<i32, String>,
+    reconnect_authorized: HashMap<String, i32>,
     last_peer_id: i32,
     received_packets: VecDeque<(i32, i32, TransferMode, Bytes)>,
     target_peer_id: i32,
@@ -47,6 +53,8 @@ impl IrohServer {
             accepted_peer_receiver,
             refuse_new_connections: false,
             peers: HashMap::new(),
+            peer_node_ids: HashMap::new(),
+            reconnect_authorized: HashMap::new(),
             last_peer_id: 1,
             received_packets: VecDeque::new(),
             transfer_channel: 0,
@@ -101,6 +109,23 @@ impl IrohServer {
             .map(|connection| connection.connection_string().to_godot_owned())
             .unwrap_or_default()
     }
+
+    /// Authorizes a previously-connected `peer_id` to reclaim its identity on
+    /// reconnect. If a peer that had this id (identified by its EndpointId)
+    /// dials in again, it is reissued this same peer id instead of a fresh
+    /// one. The authorization is persistent (the peer may reconnect more than
+    /// once) and safe because the id is only reissued to the same
+    /// authenticated identity that originally held it.
+    ///
+    /// Call this once per player after the roster is established (rather than
+    /// after a disconnect), so a reconnect can't race ahead of the host
+    /// noticing the drop. No-op if the peer id was never seen.
+    #[func]
+    fn authorize_reconnect(&mut self, peer_id: i32) {
+        if let Some(node_id) = self.peer_node_ids.get(&peer_id) {
+            self.reconnect_authorized.insert(node_id.clone(), peer_id);
+        }
+    }
 }
 
 #[godot_api]
@@ -108,12 +133,23 @@ impl IMultiplayerPeerExtension for IrohServer {
     fn poll(&mut self) {
         // Accept new connections
         while let Ok(connection) = self.listener.receive_connection() {
-            let peer_id = {
-                self.last_peer_id = (self.last_peer_id + 1) % i32::MAX;
-                if self.last_peer_id < 2 {
-                    self.last_peer_id = 2;
+            // If this incoming connection's identity was authorized to
+            // reconnect, reissue its original peer id; otherwise assign a
+            // fresh one. remote_id() is cryptographically authenticated, so a
+            // client can't claim an identity that isn't its own.
+            let node_id = connection_node_id_string(&connection);
+            // Persistent authorization (not consumed on use) so a player may
+            // reconnect repeatedly. Safe because the id is only reissued to
+            // the same authenticated EndpointId that originally held it.
+            let peer_id = match self.reconnect_authorized.get(&node_id).copied() {
+                Some(existing_peer_id) => existing_peer_id,
+                None => {
+                    self.last_peer_id = (self.last_peer_id + 1) % i32::MAX;
+                    if self.last_peer_id < 2 {
+                        self.last_peer_id = 2;
+                    }
+                    self.last_peer_id
                 }
-                self.last_peer_id
             };
             let accepted_peer_sender = self.accepted_peer_sender.clone();
             IrohRuntime::spawn(async move {
@@ -125,6 +161,9 @@ impl IMultiplayerPeerExtension for IrohServer {
 
         // Register new peers
         while let Ok((peer_id, connection)) = self.accepted_peer_receiver.try_recv() {
+            // Remember this peer's identity so it can be matched on reconnect.
+            self.peer_node_ids
+                .insert(peer_id, connection.connection_string());
             self.peers.insert(peer_id, connection);
             self.base_mut()
                 .emit_signal("peer_connected", &[peer_id.to_variant()]);

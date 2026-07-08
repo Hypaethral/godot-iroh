@@ -1,12 +1,16 @@
 use std::collections::{HashMap, hash_map::Entry};
+use std::io::{Read, Write};
 
 use anyhow::{Context, bail};
 use base64::prelude::*;
 use bytes::{Buf, Bytes};
+use flate2::Compression;
+use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
 use godot::{classes::multiplayer_peer::TransferMode, global::godot_error, prelude::godot_warn};
 use iroh::{
-    Endpoint, EndpointId,
-    endpoint::{Connection, VarInt},
+    Endpoint, EndpointId, SecretKey,
+    endpoint::{Connection, presets, QuicTransportConfig, VarInt},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -14,6 +18,58 @@ use tokio::{
 };
 
 use crate::{ALPN, IrohRuntime};
+
+pub(crate) async fn build_endpoint(secret_key: Option<SecretKey>) -> anyhow::Result<Endpoint> {
+    let transport: QuicTransportConfig = QuicTransportConfig::default();
+    let mut builder = Endpoint::builder(presets::N0)
+        .alpns(vec![ALPN.to_vec()])
+        .transport_config(transport);
+    // A stable secret key gives the endpoint a stable EndpointId across
+    // rebuilds, which is how the server recognizes a reconnecting client
+    // and reissues its original peer id. Server passes None (fresh identity
+    // each session); client passes a persistent key.
+    if let Some(secret_key) = secret_key {
+        builder = builder.secret_key(secret_key);
+    }
+    let endpoint = builder.bind().await?;
+    Ok(endpoint)
+}
+
+/// Base64 node-id string for an incoming raw connection, matching the format
+/// produced by [IrohConnection::connection_string]. Used server-side to
+/// recognize a reconnecting peer by its (authenticated) EndpointId.
+pub(crate) fn connection_node_id_string(connection: &Connection) -> String {
+    BASE64_URL_SAFE_NO_PAD.encode(connection.remote_id().as_bytes())
+}
+
+// Packets at or below this size aren't worth compressing (deflate overhead
+// would usually make them bigger).
+const COMPRESS_THRESHOLD: usize = 64;
+
+/// Returns (compressed_flag, payload). Compresses with deflate only when the
+/// result is actually smaller than the input; otherwise returns the original
+/// bytes with flag 0. This keeps small packets penalty-free.
+fn maybe_compress(data: &[u8]) -> (u8, Vec<u8>) {
+    if data.len() <= COMPRESS_THRESHOLD {
+        return (0, data.to_vec());
+    }
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    if encoder.write_all(data).is_ok() {
+        if let Ok(compressed) = encoder.finish() {
+            if compressed.len() < data.len() {
+                return (1, compressed);
+            }
+        }
+    }
+    (0, data.to_vec())
+}
+
+fn decompress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut decoder = DeflateDecoder::new(data);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
+}
 
 pub struct IrohListener {
     pub(crate) endpoint: Endpoint,
@@ -23,10 +79,7 @@ pub struct IrohListener {
 
 impl IrohListener {
     pub async fn new() -> anyhow::Result<Self> {
-        let endpoint = Endpoint::builder()
-            .alpns(vec![ALPN.to_vec()])
-            .bind()
-            .await?;
+        let endpoint = build_endpoint(None).await?;
 
         // Accept connection loop
         let endpoint_clone = endpoint.clone();
@@ -88,6 +141,19 @@ impl IrohConnection {
         let (unreliable_sender, mut unreliable_receiver) =
             unbounded_channel::<(i32, bool, Vec<u8>)>();
         let (packet_sender, packet_receiver) = channel(32);
+
+        // Diagnostic: log establishment + why/when the QUIC connection closes.
+        // The close reason is the authoritative signal for drops - it
+        // distinguishes an idle timeout (TimedOut) from an application close,
+        // a reset, or a transport/path error, which the Godot layer can't see.
+        // (For direct-vs-relay, use the in-game ping RTT, or add a log over
+        // connection.paths()/PathInfo::remote_addr per the iroh 0.96 API.)
+        let connection_clone = connection.clone();
+        godot_warn!("[iroh] connection established (remote {:?})", connection_clone.remote_id());
+        tokio::spawn(async move {
+            let reason = connection_clone.closed().await;
+            godot_warn!("[iroh] connection closed (remote {:?}): {:?}", connection_clone.remote_id(), reason);
+        });
 
         // Unreliable packet send loop
         let connection_clone = connection.clone();
@@ -164,9 +230,17 @@ impl IrohConnection {
                 tokio::spawn(async move {
                     let channel = stream.read_i32().await?;
                     loop {
+                        // Framing: [compressed: u8][len: u16][payload: len bytes].
+                        // See send_packet / maybe_compress.
+                        let compressed = stream.read_u8().await?;
                         let packet_len = stream.read_u16().await?;
-                        let mut packet = vec![0u8; packet_len as usize];
-                        stream.read_exact(&mut packet).await?;
+                        let mut payload = vec![0u8; packet_len as usize];
+                        stream.read_exact(&mut payload).await?;
+                        let packet = if compressed == 1 {
+                            decompress(&payload)?
+                        } else {
+                            payload
+                        };
                         if packet_sender
                             .send((channel, TransferMode::RELIABLE, packet.into()))
                             .await
@@ -227,16 +301,25 @@ impl IrohConnection {
                         let mut stream = connection.open_uni().await?;
                         stream.write_i32(channel).await?;
                         while let Some(packet) = receiver.recv().await {
-                            if packet.len() > u16::MAX as usize {
+                            // Compress the payload (deflate) to cut bandwidth
+                            // on the repetitive structured game data - iroh has
+                            // no equivalent of ENet's COMPRESS_RANGE_CODER, so
+                            // we do it here. Only kept if it actually shrinks
+                            // (see maybe_compress), so small packets pay nothing.
+                            // Framing: [compressed: u8][len: u16][payload].
+                            let (compressed, payload) = maybe_compress(&packet);
+                            if payload.len() > u16::MAX as usize {
                                 godot_error!(
-                                    "Reliable packet on channel {} (size: {}) exceeds the maximum allowed size of {} bytes and cannot be sent",
+                                    "Reliable packet on channel {} (size: {}, on-wire: {}) exceeds the maximum allowed size of {} bytes and cannot be sent",
                                     channel,
                                     packet.len(),
+                                    payload.len(),
                                     u16::MAX,
                                 );
                             } else {
-                                stream.write_u16(packet.len().try_into()?).await?;
-                                stream.write_all(&packet).await?;
+                                stream.write_u8(compressed).await?;
+                                stream.write_u16(payload.len() as u16).await?;
+                                stream.write_all(&payload).await?;
                             }
                         }
 

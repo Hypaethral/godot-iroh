@@ -1,17 +1,31 @@
 use std::collections::VecDeque;
 use std::mem::replace;
+use std::sync::OnceLock;
 
 use bytes::Bytes;
 use godot::classes::multiplayer_peer::{ConnectionStatus, TransferMode};
 use godot::classes::{IMultiplayerPeerExtension, MultiplayerPeerExtension};
 use godot::global::Error;
 use godot::prelude::*;
-use iroh::Endpoint;
+use iroh::{Endpoint, SecretKey};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::task::JoinHandle;
 
 use crate::connection::IrohConnection;
-use crate::{ALPN, IrohRuntime};
+use crate::IrohRuntime;
+
+// Persistent client identity for the lifetime of the process. Reusing one
+// SecretKey means every IrohClient built here shares a single EndpointId,
+// so when the client redials after a drop the server recognizes it as the
+// same identity and reissues its original peer id (see IrohServer).
+static CLIENT_SECRET_KEY: OnceLock<SecretKey> = OnceLock::new();
+
+fn client_secret_key() -> SecretKey {
+    // NOTE (build-time): iroh 0.96's SecretKey::generate() takes no argument.
+    // If your iroh version requires an RNG, use
+    // `SecretKey::generate(rand::rngs::OsRng)` and add `rand` to Cargo.toml.
+    CLIENT_SECRET_KEY.get_or_init(SecretKey::generate).clone()
+}
 
 enum ClientStatus {
     Connecting(JoinHandle<anyhow::Result<(Endpoint, i32, IrohConnection)>>),
@@ -45,11 +59,9 @@ impl IrohClient {
     #[func]
     fn connect(node_id: GString) -> Gd<Self> {
         let node_id = node_id.to_string();
-        let handle = IrohRuntime::spawn(async {
-            let endpoint = Endpoint::builder()
-                .alpns(vec![ALPN.to_vec()])
-                .bind()
-                .await?;
+        let secret_key = client_secret_key();
+        let handle = IrohRuntime::spawn(async move {
+            let endpoint = crate::connection::build_endpoint(Some(secret_key)).await?;
             let (peer_id, connection) = IrohConnection::connect(endpoint.clone(), node_id).await?;
             Ok((endpoint, peer_id, connection))
         });
