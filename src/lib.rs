@@ -11,7 +11,9 @@ const ALPN: &[u8] = b"godot-iroh/0.1";
 mod client;
 mod connection;
 mod server;
+mod network_logger;
 
+use crate::network_logger::NetworkLogger;
 struct MyExtension;
 
 #[gdextension]
@@ -44,12 +46,24 @@ pub struct IrohRuntime {
 #[godot_api]
 impl IObject for IrohRuntime {
     fn init(base: Base<Object>) -> Self {
+        let log_path = std::path::PathBuf::from(
+            godot::classes::ProjectSettings::singleton()
+                .globalize_path("user://network/iroh_debug.log")
+                .to_string(),
+        );
+
+        NetworkLogger::init(log_path)
+            .expect("failed to initialize network logger");
+
+        NetworkLogger::info("Logger initialized.");
+
         let runtime = Some(
             runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .unwrap(),
         );
+
         Self { base, runtime }
     }
 }

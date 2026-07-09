@@ -13,8 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::connection::IrohConnection;
 use crate::IrohRuntime;
-use std::fs::OpenOptions;
-use std::io::Write;
+use crate::network_logger::NetworkLogger;
 
 // Persistent client identity for the lifetime of the process. Reusing one
 // SecretKey means every IrohClient built here shares a single EndpointId,
@@ -50,16 +49,6 @@ struct IrohClient {
     transfer_mode: TransferMode,
 }
 
-fn debug_log(msg: &str) {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("C:\\temp\\iroh_debug.txt")
-        .unwrap();
-
-    writeln!(file, "{msg}").unwrap();
-}
-
 #[godot_api]
 impl IrohClient {
     /// Connect to an existing server using the connection string.
@@ -70,22 +59,22 @@ impl IrohClient {
     /// [Self::connection_error] function.
     #[func]
     fn connect(node_id: GString) -> Gd<Self> {
-        debug_log("[client] IrohClient::connect called");
+        NetworkLogger::debug("[client] IrohClient::connect called");
 
         let node_id = node_id.to_string();
-        debug_log(&format!("[client] target node id = {}", node_id));
+        NetworkLogger::debug(&format!("[client] target node id = {}", node_id));
 
         let node_id = node_id.to_string();
         let secret_key = client_secret_key();
         let handle = IrohRuntime::spawn(async move {
-            debug_log("[client task] started");
+            NetworkLogger::debug("[client task] started");
             let endpoint = crate::connection::build_endpoint(Some(secret_key)).await?;
-            debug_log(&format!(
+            NetworkLogger::debug(&format!(
                 "[client task] endpoint created id={:?}; now attempting dial",
                 endpoint.id()
             ));
             let (peer_id, connection) = IrohConnection::connect(endpoint.clone(), node_id).await?;
-            debug_log(&format!(
+            NetworkLogger::debug(&format!(
                 "[client task] connected, assigned peer id {}",
                 peer_id
             ));

@@ -14,19 +14,7 @@ use tokio::{
 };
 
 use crate::{ALPN, IrohRuntime};
-
-use std::fs::OpenOptions;
-use std::io::Write;
-
-fn debug_log(msg: &str) {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("C:\\temp\\iroh_debug.txt")
-        .unwrap();
-
-    writeln!(file, "{msg}").unwrap();
-}
+use crate::network_logger::NetworkLogger;
 
 pub(crate) async fn build_endpoint(secret_key: Option<SecretKey>) -> anyhow::Result<Endpoint> {
     let transport: QuicTransportConfig = QuicTransportConfig::default();
@@ -42,7 +30,7 @@ pub(crate) async fn build_endpoint(secret_key: Option<SecretKey>) -> anyhow::Res
         builder = builder.secret_key(secret_key);
     }
     let endpoint = builder.bind().await?;
-    debug_log(&format!("[debug] client build_endpoint with sk = {} endpoint id = {:?}", has_secret_key, endpoint.id()));
+    NetworkLogger::debug(&format!("[debug] client build_endpoint with sk = {} endpoint id = {:?}", has_secret_key, endpoint.id()));
     Ok(endpoint)
 }
 
@@ -68,11 +56,11 @@ impl IrohListener {
         let (connection_sender, connection_receiver) = channel(32);
         tokio::spawn(async move {
             while let Some(incoming) = endpoint_clone.accept().await {
-                debug_log("[server] incoming connection object");
+                NetworkLogger::debug("[server] incoming connection object");
 
                 match incoming.await {
                     Ok(connection) => {
-                        debug_log(&format!(
+                        NetworkLogger::debug(&format!(
                             "[server] QUIC accepted from {:?}",
                             connection.remote_id()
                         ));
@@ -82,7 +70,7 @@ impl IrohListener {
                         }
                     }
                     Err(e) => {
-                        debug_log(&format!(
+                        NetworkLogger::error(&format!(
                             "[server] QUIC handshake failed: {:#}",
                             e
                         ));
@@ -145,10 +133,10 @@ impl IrohConnection {
         // (For direct-vs-relay, use the in-game ping RTT, or add a log over
         // connection.paths()/PathInfo::remote_addr per the iroh 0.96 API.)
         let connection_clone = connection.clone();
-        debug_log(&format!("[debug-iroh] connection established (remote {:?})", connection_clone.remote_id()));
+        NetworkLogger::debug(&format!("[debug-iroh] connection established (remote {:?})", connection_clone.remote_id()));
         tokio::spawn(async move {
             let reason = connection_clone.closed().await;
-            debug_log(&format!("[debug-iroh] connection closed (remote {:?}): {:?}", connection_clone.remote_id(), reason));
+            NetworkLogger::warn(&format!("[debug-iroh] connection closed (remote {:?}): {:?}", connection_clone.remote_id(), reason));
         });
 
         // Unreliable packet send loop
@@ -169,7 +157,7 @@ impl IrohConnection {
                 }
                 let max_datagram_size = connection_clone.max_datagram_size().unwrap_or(1024);
                 if buffer.len() > max_datagram_size {
-                    debug_log(&format!(
+                    NetworkLogger::error(&format!(
                         "Unreliable packet on channel {} (size: {}) exceeds {} bytes and will likely be discarded by the network",
                         channel,
                         buffer.len(),
@@ -290,8 +278,8 @@ impl IrohConnection {
                         stream.write_i32(channel).await?;
                         while let Some(packet) = receiver.recv().await {
                             if packet.len() > u16::MAX as usize {
-                                debug_log(&format!(
-                                    "ERR: Reliable packet on channel {} (size: {}) exceeds the maximum allowed size of {} bytes and cannot be sent",
+                                NetworkLogger::error(&format!(
+                                    "Reliable packet on channel {} (size: {}) exceeds the maximum allowed size of {} bytes and cannot be sent",
                                     channel,
                                     packet.len(),
                                     u16::MAX,
